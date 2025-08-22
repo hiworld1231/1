@@ -1,8 +1,8 @@
--- AutoHarvest v4 — Bamboo-by-Bamboo
--- 1) Находит ВСЕ бамбуки (существующие и новые) в workspace.BambooForest.SpawnedBamboo
--- 2) ТП к КАЖДОМУ КОНКРЕТНОМУ БАМБУКУ (его модели)
--- 3) Активирует его ProximityPrompt "HarvestPrompt"
--- 4) Повторяет для всех, переживает пересоздание контейнера. НИЧЕГО НЕ УДАЛЯЕТ.
+-- AutoHarvest v4.2 — только SpawnedBamboo, ТП к каждому бамбуку
+-- 1) Находит ВСЕ модели внутри workspace.BambooForest.SpawnedBamboo (старые и новые)
+-- 2) ТП к КАЖДОМУ конкретному бамбуку (модель = прямой ребёнок SpawnedBamboo)
+-- 3) Нажимает его ProximityPrompt ("HarvestPrompt" или любой, если имя другое)
+-- 4) Повторяет для всех. НИЧЕГО НЕ УДАЛЯЕТ.
 
 local ws = game:GetService("Workspace")
 local Players = game:GetService("Players")
@@ -12,19 +12,19 @@ local LP = Players.LocalPlayer
 
 -- антидвойной запуск
 local env = (getgenv and getgenv()) or _G or shared
-if env.__AutoHarvestV4_Running then return end
-env.__AutoHarvestV4_Running = true
+if env.__AutoHarvestV42_Running then return end
+env.__AutoHarvestV42_Running = true
 
 -- ===== Настройки =====
 local CFG = {
-	PATH_ROOT_NAME   = "BambooForest",
-	CONTAINER_NAME   = "SpawnedBamboo",
-	PROMPT_NAME      = "HarvestPrompt",
-	Y_OFFSET         = 3,     -- на сколько студов выше точки ТП
-	NEAR_DIST        = 8,     -- считаем что подбежали
-	TP_TIMEOUT       = 1.5,   -- сек ожидания после ТП
-	LOYAL_PROMPT     = true,  -- мягко подправлять свойства промпта (Hold=0, и т.п.)
-	RESCAN_INTERVAL  = 2.5,   -- периодический рескан
+	ROOT_NAME       = "BambooForest",   -- модель-плита, в ней нас интересует только папка SpawnedBamboo
+	FOLDER_NAME     = "SpawnedBamboo",  -- папка с МОДЕЛЯМИ БАМБУКА (каждый бамбук — отдельная Model)
+	PROMPT_NAME     = "HarvestPrompt",  -- целевое имя; если не найден, берём любой ProximityPrompt в модели
+	Y_OFFSET        = 3,
+	NEAR_DIST       = 8,
+	TP_TIMEOUT      = 1.5,
+	RESCAN_INTERVAL = 2.5,
+	LOYAL_PROMPT    = true,             -- подправлять свойства промпта (HoldDuration=0 и т.д.)
 }
 
 -- ===== Утилиты =====
@@ -51,29 +51,13 @@ local function getChar()
 	return char, hrp, hum
 end
 
--- вернуть МОДЕЛЬ конкретного бамбука по промпту
-local function bambooModelFromPrompt(p)
-	if not p then return nil end
-	local m = p:FindFirstAncestorOfClass("Model")
-	if m then return m end
-	if p.Parent then
-		m = p.Parent:FindFirstAncestorOfClass("Model")
-		if m then return m end
-	end
-	return nil
-end
-
--- позиция модели бамбука
-local function getModelPos(model)
+local function modelWorldPos(model)
 	if not model then return nil end
-	-- GetPivot (Roblox API)
 	if model.GetPivot then
 		local ok, cf = pcall(function() return model:GetPivot() end)
 		if ok and cf then return cf.Position end
 	end
-	-- PrimaryPart
 	if model.PrimaryPart then return model.PrimaryPart.Position end
-	-- Любой BasePart
 	local part = model:FindFirstChildWhichIsA("BasePart", true)
 	if part then return part.Position end
 	return nil
@@ -105,64 +89,62 @@ local function teleportTo(pos)
 		end
 		RunService.Heartbeat:Wait()
 	end
-	return true -- даже если не уложились по таймауту, идём дальше
+	return true
 end
 
--- ===== учёт бамбуков и очередь =====
--- На каждом бамбуке может быть 1 промпт. Обрабатываем БАМБУК (модель), а не общий контейнер.
-local seenBamboo = setmetatable({}, { __mode = "k" }) -- чтобы не дублировать в очереди
+-- ===== Работаем ТОЛЬКО с моделями — ПРЯМЫМИ детьми SpawnedBamboo =====
+local processed = setmetatable({}, { __mode = "k" }) -- какие модели уже поставлены в очередь
 local queue, processing = {}, false
+local currentSpawned -- ссылка на актуальную папку SpawnedBamboo
 
-local function findPromptInBamboo(model)
+local function findPromptIn(model)
 	if not model then return nil end
-	-- точное имя
+	-- приоритет: точное имя
 	local p = model:FindFirstChild(CFG.PROMPT_NAME, true)
 	if p and p:IsA("ProximityPrompt") then return p end
-	-- или просто любой ProximityPrompt внутри
+	-- иначе — первый попавшийся ProximityPrompt
 	for _, d in ipairs(model:GetDescendants()) do
 		if d:IsA("ProximityPrompt") then return d end
 	end
 	return nil
 end
 
-local function enqueueBamboo(model)
-	if not model or seenBamboo[model] then return end
-	seenBamboo[model] = true
+local function enqueueModel(model)
+	if not model or processed[model] then return end
+	processed[model] = true
 	table.insert(queue, model)
 
 	if processing then return end
 	processing = true
 	task.spawn(function()
-		while env.__AutoHarvestV4_Running do
+		while env.__AutoHarvestV42_Running do
 			local m = table.remove(queue, 1)
 			if not m then break end
 			if m.Parent == nil then
-				seenBamboo[m] = nil
+				processed[m] = nil
 			else
-				-- ТП к КОНКРЕТНОЙ модели бамбука
-				local pos = getModelPos(m)
+				-- ТП строго к этому бамбуку (модель — прямой ребёнок SpawnedBamboo)
+				local pos = modelWorldPos(m)
 				if pos then teleportTo(pos) end
 				task.wait(0.05)
 
-				-- найти и нажать его промпт
-				local p = findPromptInBamboo(m)
+				local p = findPromptIn(m)
 				if p and p:IsA("ProximityPrompt") then
 					if CFG.LOYAL_PROMPT then
 						pcall(function()
 							p.Enabled = true
 							p.HoldDuration = 0
 							p.RequiresLineOfSight = false
-							-- расстояние оставим дефолтным: мы уже рядом
 						end)
 					end
 					if canFire() then pressPrompt(p) end
 
-					-- если промпт позже снова включится (регроу) — обработаем повторно
+					-- если промпт снова включат (регроу) — обработать ещё раз
 					pcall(function()
 						p:GetPropertyChangedSignal("Enabled"):Connect(function()
 							if p.Enabled then
-								seenBamboo[m] = nil
-								enqueueBamboo(m)
+								processed[m] = nil
+								enqueueModel(m)
 							end
 						end)
 					end)
@@ -174,24 +156,39 @@ local function enqueueBamboo(model)
 	end)
 end
 
--- скан контейнера на ВСЕ бамбуки: берём модели, в которых есть ProximityPrompt
-local function scanContainer(container)
-	if not container then return end
-	for _, obj in ipairs(container:GetDescendants()) do
-		if obj:IsA("ProximityPrompt") then
-			local m = bambooModelFromPrompt(obj)
-			if m then enqueueBamboo(m) end
+-- пройтись только по прямым детям SpawnedBamboo и поставить их в очередь
+local function scanSpawned()
+	if not currentSpawned then return end
+	for _, child in ipairs(currentSpawned:GetChildren()) do
+		if child:IsA("Model") then
+			enqueueModel(child)
 		end
 	end
 end
 
-local function hookContainer(container)
-	if not container then return end
-	scanContainer(container)
-	container.DescendantAdded:Connect(function(obj)
+-- любые новые объекты под SpawnedBamboo: если это модель — сразу в очередь;
+-- если это что-то внутри модели (например, сам ProximityPrompt) — берём верхнюю модель-ребёнка SpawnedBamboo.
+local function hookSpawned(folder)
+	currentSpawned = folder
+	scanSpawned()
+
+	folder.ChildAdded:Connect(function(obj)
+		if obj:IsA("Model") then
+			enqueueModel(obj)
+		end
+	end)
+
+	-- на случай, если добавляют глубже, чем в корень папки:
+	folder.DescendantAdded:Connect(function(obj)
 		if obj:IsA("ProximityPrompt") then
-			local m = bambooModelFromPrompt(obj)
-			if m then enqueueBamboo(m) end
+			-- подняться до модели, которая является ПРЯМЫМ ребёнком SpawnedBamboo
+			local m = obj:FindFirstAncestorOfClass("Model")
+			while m and m.Parent ~= folder do
+				m = m.Parent and m.Parent:FindFirstAncestorOfClass("Model") or nil
+			end
+			if m and m.Parent == folder then
+				enqueueModel(m)
+			end
 		end
 	end)
 end
@@ -200,26 +197,31 @@ end
 task.spawn(function()
 	getChar()
 
-	-- приоритетный путь: workspace.BambooForest.SpawnedBamboo
-	local bambooRoot = ws:FindFirstChild(CFG.PATH_ROOT_NAME)
-	if bambooRoot then
-		local spawned = bambooRoot:FindFirstChild(CFG.CONTAINER_NAME)
-		if spawned then hookContainer(spawned) end
-		bambooRoot.ChildAdded:Connect(function(child)
-			if child.Name == CFG.CONTAINER_NAME then
-				hookContainer(child)
-			end
-		end)
-	else
-		-- если нет BambooForest — работаем по всему workspace (на случай другой структуры)
-		hookContainer(ws)
+	local forest = ws:WaitForChild(CFG.ROOT_NAME, 30)
+	if not forest then
+		warn("[AutoHarvest v4.2] Не найден workspace." .. CFG.ROOT_NAME)
+		return
 	end
 
-	-- периодический рескан, чтобы подхватывать всё (стриминг/потери событий)
+	local spawned = forest:WaitForChild(CFG.FOLDER_NAME, 30)
+	if not spawned then
+		warn("[AutoHarvest v4.2] Не найдена папка " .. CFG.FOLDER_NAME .. " в " .. CFG.ROOT_NAME)
+		return
+	end
+
+	hookSpawned(spawned)
+
+	-- если папку пересоздают — пере-хукаемся
+	forest.ChildAdded:Connect(function(child)
+		if child.Name == CFG.FOLDER_NAME then
+			hookSpawned(child)
+		end
+	end)
+
+	-- периодический рескан только папки SpawnedBamboo
 	task.spawn(function()
-		while env.__AutoHarvestV4_Running do
-			local container = bambooRoot and bambooRoot:FindFirstChild(CFG.CONTAINER_NAME) or ws
-			scanContainer(container)
+		while env.__AutoHarvestV42_Running do
+			scanSpawned()
 			task.wait(CFG.RESCAN_INTERVAL)
 		end
 	end)
