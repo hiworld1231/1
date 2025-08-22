@@ -1,6 +1,6 @@
--- AutoHarvest v3.1 — TP -> Fire (fixed typeof)
--- Телепортируется к каждому HarvestPrompt в workspace.BambooForest.SpawnedBamboo
--- и нажимает его. Живучий к пересозданиям/новым объектам.
+-- AutoHarvest v3.2 — TP к модели -> активация промпта
+-- Телепорт к модели, содержащей ProximityPrompt "HarvestPrompt", затем нажатие.
+-- Живучий к пересозданиям/новым объектам, с очередью, ресканом и анти-дублем.
 
 local ws = game:GetService("Workspace")
 local Players = game:GetService("Players")
@@ -16,20 +16,19 @@ env.__AutoHarvestV3_Running = true
 -- настройки телепорта
 local CFG = {
 	Y_OFFSET = 3,      -- на сколько студов выше целевой точки появляться
-	NEAR_DIST = 8,     -- расстояние, которое считаем «подошёл»
-	TP_TIMEOUT = 1.5,  -- сколько секунд ждём сближения после телепорта
+	NEAR_DIST = 8,     -- считаем, что "подошли", если ближе этой дистанции
+	TP_TIMEOUT = 1.5,  -- сколько секунд ждать сближения после телепорта
 }
 
--- кэш "подписанных" промптов
+-- кэш "подписанных" промптов (слабые ссылки)
 local watched = setmetatable({}, { __mode = "k" })
 
--- проверка доступности «стрельбы» по промпту в любом окружении
+-- проверка возможности «нажатия» промпта
 local function canFire()
 	return type(fireproximityprompt) == "function" or (PPS and PPS.TriggerPrompt)
 end
 
 local function firePrompt(p)
-	-- несколько попыток на случай лагов/репликации
 	for i = 1, 3 do
 		if type(fireproximityprompt) == "function" then
 			pcall(function() fireproximityprompt(p) end)
@@ -42,32 +41,68 @@ end
 
 local function getChar()
 	local char = LP.Character or LP.CharacterAdded:Wait()
-	local hrp = char:FindFirstChild("HumanoidRootPart")
-	local hum = char:FindFirstChildOfClass("Humanoid")
+	local hrp = char:FindFirstChild("HumanoidRootPart") or char:WaitForChild("HumanoidRootPart")
+	local hum = char:FindFirstChildOfClass("Humanoid") or char:WaitForChild("Humanoid")
 	if not hrp or not hum or hum.Health <= 0 then return nil end
 	return char, hrp, hum
 end
 
-local function getPromptPos(p)
+-- найти модель, к которой относится промпт
+local function getModelFromPrompt(p)
 	if not p then return nil end
-	local adornee = p.Adornee or p.Parent
-	if not adornee then return nil end
-
-	if adornee:IsA("Attachment") then
-		return adornee.WorldPosition
-	end
-	if adornee:IsA("BasePart") then
-		return adornee.Position
-	end
-
-	local part = adornee:FindFirstAncestorOfClass("BasePart")
-	if part then return part.Position end
-
-	local model = adornee:FindFirstAncestorOfClass("Model")
-	if model and model.PrimaryPart then
-		return model.PrimaryPart.Position
+	-- сам промпт может лежать на Attachment/BasePart — поднимаемся к ближайшей модели
+	local model = p:FindFirstAncestorOfClass("Model")
+	if model then return model end
+	local parent = p.Parent
+	if parent then
+		model = parent:FindFirstAncestorOfClass("Model")
+		if model then return model end
 	end
 	return nil
+end
+
+-- получить мировую позицию модели (pivot/primary/любой BasePart)
+local function getModelPos(model)
+	if not model then return nil end
+
+	if model.GetPivot then
+		local ok, cf = pcall(function() return model:GetPivot() end)
+		if ok and cf then
+			local pos = cf.Position
+			if pos then return pos end
+		end
+	end
+
+	if model.PrimaryPart then
+		return model.PrimaryPart.Position
+	end
+
+	local part = model:FindFirstChildWhichIsA("BasePart", true)
+	if part then return part.Position end
+
+	return nil
+end
+
+-- запасной способ: если модель не нашлась, телепорт к носителю промпта
+local function getFallbackPosFromPrompt(p)
+	local parent = p and p.Parent
+	if not parent then return nil end
+	if parent:IsA("Attachment") then
+		return parent.WorldPosition
+	end
+	if parent:IsA("BasePart") then
+		return parent.Position
+	end
+	local part = parent:FindFirstAncestorOfClass("BasePart")
+	if part then return part.Position end
+	return nil
+end
+
+local function getTargetPosFromPrompt(p)
+	local model = getModelFromPrompt(p)
+	local pos = getModelPos(model)
+	if pos then return pos end
+	return getFallbackPosFromPrompt(p)
 end
 
 local function teleportTo(pos)
@@ -89,17 +124,15 @@ local function teleportTo(pos)
 		end
 	end
 
-	-- ждём, пока реально окажемся рядом
-	local ok = false
+	-- ждём фактического сближения
 	local t0 = os.clock()
 	while os.clock() - t0 < CFG.TP_TIMEOUT do
 		if (hrp.Position - target).Magnitude < CFG.NEAR_DIST then
-			ok = true
-			break
+			return true
 		end
 		RunService.Heartbeat:Wait()
 	end
-	return ok
+	return false
 end
 
 -- очередь, чтобы не телепортироваться параллельно
@@ -121,8 +154,8 @@ local function enqueue(p)
 					item.MaxActivationDistance = 1000
 				end)
 
-				-- телепорт и нажатие
-				local pos = getPromptPos(item)
+				-- телепорт к МОДЕЛИ и нажатие
+				local pos = getTargetPosFromPrompt(item)
 				if pos then teleportTo(pos) end
 				task.wait(0.05)
 				if canFire() then firePrompt(item) end
@@ -179,7 +212,7 @@ task.spawn(function()
 
 	local bamboo = ws:WaitForChild("BambooForest", 30)
 	if not bamboo then
-		warn("[AutoHarvest v3.1] Не найден workspace.BambooForest")
+		warn("[AutoHarvest v3.2] Не найден workspace.BambooForest")
 		return
 	end
 
@@ -192,7 +225,7 @@ task.spawn(function()
 		end
 	end)
 
-	-- страховочный рескан
+	-- страховочный рескан (стрим/потери ивентов)
 	task.spawn(function()
 		while env.__AutoHarvestV3_Running do
 			local sb = bamboo:FindFirstChild("SpawnedBamboo")
