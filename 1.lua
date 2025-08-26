@@ -17,5 +17,5 @@ while true do
             end
         end
     end
-    task.wait(0.000000000001)
+    task.wait()
 end
