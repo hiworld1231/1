@@ -1,135 +1,79 @@
--- ultra-fast auto-activator for "propogandaPoster" nearby the local player
--- Place as a LocalScript in StarterPlayerScripts
+--[[
+Instant-активация всех ProximityPrompt'ов "PosterPrompt" внутри моделей "propogandaPoster",
+если игрок находится в радиусе MaxActivationDistance каждого из них.
+Работает одним скриптом: запускается сразу и повторно по клавише K.
+]]
 
 local Players = game:GetService("Players")
-local RunService = game:GetService("RunService")
-local Workspace = game:GetService("Workspace")
+local ProximityPromptService = game:GetService("ProximityPromptService")
+local UserInputService = game:GetService("UserInputService")
+local StarterGui = game:GetService("StarterGui")
 
--- === config (меняй при необходимости) ==========================
-local POSTER_MODEL_NAME = "propogandaPoster"
-local MAIN_PART_NAME    = "MainPoster"
-local PROMPT_NAME       = "PosterPrompt"
+local LOCAL_PLAYER = Players.LocalPlayer
+local HOTKEY = Enum.KeyCode.K -- поменяй при желании
 
--- Если нужно прямо одновременное срабатывание множества подсказок на одной кнопке,
--- можно разрешить отображение всех сразу (обычно и без этого ок):
-local FORCE_ALWAYS_SHOW = false
--- ===============================================================
-
-local localPlayer = Players.LocalPlayer
-local character = localPlayer.Character or localPlayer.CharacterAdded:Wait()
-local rootPart = character:WaitForChild("HumanoidRootPart")
-
--- следим за респавнами
-localPlayer.CharacterAdded:Connect(function(char)
-	character = char
-	rootPart = char:WaitForChild("HumanoidRootPart")
-end)
-
--- храним все найденные промпты: [prompt] = { part = MainPoster, holding = false, t0 = 0 }
-local tracked = {}
-
-local function safeConnectPromptCleanup(prompt)
-	prompt.AncestryChanged:Connect(function(_, parent)
-		if not parent then
-			tracked[prompt] = nil
-		end
-	end)
-	prompt.Destroying:Connect(function()
-		tracked[prompt] = nil
-	end)
+local function getHRP()
+    local char = LOCAL_PLAYER.Character or LOCAL_PLAYER.CharacterAdded:Wait()
+    return char:WaitForChild("HumanoidRootPart")
 end
 
-local function tryRegisterFromModel(model: Model)
-	if model.Name ~= POSTER_MODEL_NAME then return end
-
-	-- ищем MainPoster (Part) и внутри него PosterPrompt
-	local main = model:FindFirstChild(MAIN_PART_NAME, true)
-	if not (main and main:IsA("BasePart")) then return end
-
-	local prompt = main:FindFirstChild(PROMPT_NAME)
-	if not (prompt and prompt:IsA("ProximityPrompt")) then return end
-
-	if FORCE_ALWAYS_SHOW then
-		pcall(function()
-			prompt.Exclusivity = Enum.ProximityPromptExclusivity.AlwaysShow
-		end)
-	end
-
-	if not tracked[prompt] then
-		tracked[prompt] = { part = main, holding = false, t0 = 0 }
-		safeConnectPromptCleanup(prompt)
-	end
+-- Мгновенная активация: сначала нативным API (TriggerPrompt),
+-- если игра/движок не даёт — фолбэк на fireproximityprompt (экзекьюторная функция).
+local function activatePrompt(prompt: ProximityPrompt)
+    -- Попытка нативного "настоящего" триггера (без удержания)
+    local ok = pcall(function()
+        ProximityPromptService:TriggerPrompt(prompt)
+    end)
+    if not ok and typeof(fireproximityprompt) == "function" then
+        -- Фолбэк: большинство экзекьюторов активируют без зажатия просто так
+        pcall(function()
+            fireproximityprompt(prompt)
+        end)
+    end
 end
 
--- начальный скан
-for _, inst in ipairs(Workspace:GetDescendants()) do
-	if inst:IsA("Model") and inst.Name == POSTER_MODEL_NAME then
-		tryRegisterFromModel(inst)
-	end
+local function triggerAllNearby()
+    local hrp = getHRP()
+    local hrpPos = hrp.Position
+    local activated = 0
+
+    -- Обходим ВСЕ объекты один раз
+    for _, inst in ipairs(workspace:GetDescendants()) do
+        if inst:IsA("Model") and inst.Name == "propogandaPoster" then
+            -- Ищем MainPoster (Part) и внутри него PosterPrompt
+            local main = inst:FindFirstChild("MainPoster", true)
+            if main and main:IsA("BasePart") then
+                local prompt = main:FindFirstChild("PosterPrompt", true)
+                if prompt and prompt:IsA("ProximityPrompt") and prompt.Enabled then
+                    local dist = (hrpPos - main.Position).Magnitude
+                    local maxDist = prompt.MaxActivationDistance or 10
+                    -- "Поблизости": уважаем радиус активации самого промпта (с небольшим запасом)
+                    if dist <= (maxDist + 1) then
+                        activatePrompt(prompt)
+                        activated += 1
+                    end
+                end
+            end
+        end
+    end
+
+    -- Небольшой тостер-уведомлятор (не обязателен)
+    pcall(function()
+        StarterGui:SetCore("SendNotification", {
+            Title = "Posters";
+            Text = "Активировано: " .. tostring(activated);
+            Duration = 3;
+        })
+    end)
 end
 
--- новые постеры на лету
-Workspace.DescendantAdded:Connect(function(inst)
-	if inst:IsA("Model") and inst.Name == POSTER_MODEL_NAME then
-		tryRegisterFromModel(inst)
-	elseif inst:IsA("ProximityPrompt") and inst.Name == PROMPT_NAME then
-		-- Если вдруг подсказка добавилась позже — поднимемся до Model и проверим
-		local model = inst:FindFirstAncestorOfClass("Model")
-		if model and model.Name == POSTER_MODEL_NAME then
-			tryRegisterFromModel(model)
-		end
-	end
-end)
+-- Запуск сразу
+triggerAllNearby()
 
--- как можно быстрее: каждую "физическую" итерацию (Heartbeat) без искусственных задержек
-RunService.Heartbeat:Connect(function()
-	if not (rootPart and rootPart.Parent) then return end
-
-	local now = os.clock()
-
-	for prompt, data in pairs(tracked) do
-		-- проверка валидности
-		if not (prompt and prompt.Parent and prompt.Enabled) then
-			tracked[prompt] = nil
-			continue
-		end
-		local main = data.part
-		if not (main and main.Parent) then
-			tracked[prompt] = nil
-			continue
-		end
-
-		-- дистанция до игрока; используем MaxActivationDistance самого промпта
-		local dist = (rootPart.Position - main.Position).Magnitude
-		local maxd = prompt.MaxActivationDistance or 10
-
-		if dist <= maxd + 1e-3 then
-			-- Если требуется удержание — "жмём" и держим столько, сколько задано
-			local hold = prompt.HoldDuration or 0
-			if hold > 0 then
-				if not data.holding then
-					pcall(function() prompt:InputHoldBegin() end)
-					data.holding = true
-					data.t0 = now
-				elseif now - data.t0 >= hold then
-					pcall(function() prompt:InputHoldEnd() end)
-					data.holding = false
-					data.t0 = 0
-				end
-			else
-				-- мгновенные промпты: нажать и отпустить в тот же кадр
-				pcall(function()
-					prompt:InputHoldBegin()
-					prompt:InputHoldEnd()
-				end)
-			end
-		else
-			-- вышли из радиуса — отпускаем, если держали
-			if data.holding then
-				pcall(function() prompt:InputHoldEnd() end)
-				data.holding = false
-				data.t0 = 0
-			end
-		end
-	end
+-- Хоткей для повторного прогона (K по умолчанию)
+UserInputService.InputBegan:Connect(function(input, gp)
+    if gp then return end
+    if input.KeyCode == HOTKEY then
+        triggerAllNearby()
+    end
 end)
