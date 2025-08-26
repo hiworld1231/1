@@ -4,7 +4,7 @@ local ProximityPromptService = game:GetService("ProximityPromptService")
 local RunService = game:GetService("RunService")
 
 local player = Players.LocalPlayer
-local radius = 500
+local radius = 112
 
 RunService.RenderStepped:Connect(function()
     local root = player.Character and player.Character:FindFirstChild("HumanoidRootPart")
